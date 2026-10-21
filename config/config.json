@@ -1,0 +1,19 @@
+{
+  "org": "your-org",
+  "team": "your-team",
+  "owner_ref": "@your-org/your-team",
+  "scope_repos": ["your-repo"],
+  "daily_cap": 10,
+  "exclude_title_patterns": [
+    "do not merge",
+    "^wip\\b",
+    "\\bwip\\b",
+    "code ?rabbit.*\\btest\\b",
+    "\\bpatch \\d+$",
+    "^\\s*test\\b.*\\bpr\\b"
+  ],
+  "codeowners_paths": [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"],
+  "cache_ttl_hours": 24,
+  "state_dir": "~/.claude/triage",
+  "cache_dir": "~/.claude/cache/review-triage"
+}

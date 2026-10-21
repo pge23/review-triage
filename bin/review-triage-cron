@@ -1,0 +1,43 @@
+#!/bin/bash
+# Scheduled refresh, run by launchd on Monday mornings so the statusline badge is already
+# accurate when the first session of the week opens.
+#
+# This runs the mechanical pass only: search, filter, bucket, cap, write state, refresh
+# badge. No LLM, no tokens, nothing unattended beyond `gh` reads. The digest with the
+# per-PR write-ups is a judgment pass, so it stays interactive: run /triage-reviews when
+# the badge shows a number you care about.
+
+set -u
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG="$HOME/.claude/triage/cron.log"
+
+# PATH comes from the plist, where install-cron.sh records where gh and python3 live.
+
+mkdir -p "$HOME/.claude/triage"
+log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+
+log "=== run start ($(hostname -s))"
+
+if ! command -v gh >/dev/null 2>&1; then
+  log "FAIL gh not on PATH"
+  exit 1
+fi
+if ! gh auth status >/dev/null 2>&1; then
+  log "FAIL gh not authenticated, run: gh auth login"
+  exit 1
+fi
+
+cd "$REPO" || exit 1
+
+if counts=$(./bin/review-triage-fetch --refresh-only 2>>"$LOG" \
+    | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["totals"]))' 2>>"$LOG"); then
+  log "fetch ok $counts"
+else
+  log "FAIL fetch failed, see lines above"
+  exit 1
+fi
+
+./bin/review-triage-status --refresh >/dev/null 2>&1
+log "badge now:'$(./bin/review-triage-status --plain)'"
+log "=== run end"

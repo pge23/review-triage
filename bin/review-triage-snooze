@@ -1,0 +1,50 @@
+#!/bin/bash
+# Snooze a PR so the triage pass stops raising it.
+#
+#   review-triage-snooze web#1203 14 "waiting on design"
+#   review-triage-snooze --list
+#   review-triage-snooze --clear web#1203
+
+set -euo pipefail
+STATE="$HOME/.claude/triage/state.json"
+mkdir -p "$(dirname "$STATE")"
+[ -f "$STATE" ] || echo '{"raised":{},"snoozed":{},"deferred":[]}' > "$STATE"
+
+case "${1:-}" in
+  "" | -h | --help)
+    sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+esac
+
+# Arguments go through argv, never into the source, so any quote in a reason is safe.
+python3 - "$STATE" "$@" <<'PY'
+import datetime, json, sys
+
+path, cmd, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
+with open(path) as f:
+    s = json.load(f)
+snoozed = s.setdefault("snoozed", {})
+
+if cmd == "--list":
+    if not snoozed:
+        print("no snoozes")
+    for k, v in sorted(snoozed.items()):
+        print(f"{k:24} until {v.get('until')}  {v.get('reason', '')}")
+    sys.exit(0)
+
+if cmd == "--clear":
+    if not rest:
+        sys.exit("usage: review-triage-snooze --clear <repo>#<number>")
+    snoozed.pop(rest[0], None)
+    msg = f"cleared {rest[0]}"
+else:
+    days = int(rest[0]) if rest else 14
+    until = (datetime.date.today() + datetime.timedelta(days=days)).isoformat()
+    snoozed[cmd] = {"until": until, "reason": rest[1] if len(rest) > 1 else ""}
+    s.setdefault("raised", {}).pop(cmd, None)
+    msg = f"snoozed {cmd} until {until}"
+
+with open(path, "w") as f:
+    json.dump(s, f, indent=2)
+print(msg)
+PY

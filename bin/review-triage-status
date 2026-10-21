@@ -1,0 +1,93 @@
+#!/bin/bash
+# Statusline badge for the review queue: prints " rev:N", or nothing when the
+# queue is empty. Served from a short-lived cache and refreshed in the background, so a
+# slow `gh` call never blocks a statusline render.
+#
+# Usage:
+#   review-triage-status            # render the badge (for statusline-command.sh)
+#   review-triage-status --refresh  # do the actual gh work and update the cache
+#   review-triage-status --plain    # render without ANSI colour
+
+set -u
+
+STATE="$HOME/.claude/triage/state.json"
+CONFIG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config/config.json"
+CACHE_DIR="$HOME/.claude/cache/review-triage"
+CACHE="$CACHE_DIR/badge"
+LOCK="$CACHE_DIR/badge.lock"
+TTL=300
+LOCK_TTL=120
+STALE_HOURS=24
+
+mkdir -p "$CACHE_DIR"
+
+refresh() {
+  [ -f "$STATE" ] || { echo "0 none" > "$CACHE"; return; }
+
+  ids=$(python3 -c "
+import json,sys
+try: s=json.load(open('$STATE'))
+except Exception: sys.exit(0)
+print(' '.join(s.get('raised',{}).keys()))
+")
+  [ -z "$ids" ] && { echo "0 ok" > "$CACHE"; return; }
+
+  org=$(python3 -c "import json; print(json.load(open('$CONFIG'))['org'])") || return
+
+  # A raised PR that has since merged or closed should stop counting.
+  open=0
+  for id in $ids; do
+    repo="${id%%#*}"; num="${id##*#}"
+    st=$(gh api "repos/$org/$repo/pulls/$num" --jq '.state' 2>/dev/null)
+    [ "$st" = "open" ] && open=$((open + 1))
+  done
+
+  age=$(python3 -c "
+import json,datetime
+try:
+    s=json.load(open('$STATE')); t=s.get('last_run')
+    d=(datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(t)).total_seconds()/3600
+    print('stale' if d > $STALE_HOURS else 'ok')
+except Exception: print('none')
+")
+  echo "$open $age" > "$CACHE"
+}
+
+if [ "${1:-}" = "--refresh" ]; then
+  refresh
+  exit 0
+fi
+
+# Kick a background refresh when the cache is missing or past its TTL. The lock keeps
+# concurrent statusline renders from stacking up refreshes.
+needs_refresh=1
+if [ -f "$CACHE" ]; then
+  mtime=$(stat -f %m "$CACHE" 2>/dev/null || echo 0)
+  [ $(( $(date +%s) - mtime )) -lt "$TTL" ] && needs_refresh=0
+fi
+
+# A render killed mid-refresh leaves its lock behind, which would block every later
+# refresh and freeze the badge; reclaim one older than a refresh can plausibly take.
+if [ -e "$LOCK" ]; then
+  lock_mtime=$(stat -f %m "$LOCK" 2>/dev/null || echo 0)
+  [ $(( $(date +%s) - lock_mtime )) -gt "$LOCK_TTL" ] && rm -rf "$LOCK"
+fi
+
+# mkdir is the atomic acquire, so two renders can never both claim the lock.
+if [ "$needs_refresh" = "1" ] && mkdir "$LOCK" 2>/dev/null; then
+  ( trap 'rm -rf "$LOCK"' EXIT HUP INT TERM; "$0" --refresh >/dev/null 2>&1 ) &
+  disown 2>/dev/null
+fi
+
+[ -f "$CACHE" ] || exit 0
+read -r count age < "$CACHE"
+[ "${count:-0}" -gt 0 ] 2>/dev/null || exit 0
+
+mark=""
+[ "$age" = "stale" ] && mark="!"
+
+if [ "${1:-}" = "--plain" ]; then
+  printf " rev:%s%s" "$count" "$mark"
+else
+  printf " \033[35mrev:%s%s\033[0m" "$count" "$mark"
+fi

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.review-triage</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO__/bin/review-triage-cron</string>
+    </array>
+
+    <!-- Monday at 09:00. launchd Weekday: 1 is Monday, 0 and 7 are Sunday. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Don't fire on login or on every reload, only on the schedule. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude/triage/cron.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude/triage/cron.err.log</string>
+
+    <!-- launchd gives a minimal environment; filled in from the installing shell. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

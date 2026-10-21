@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Fetch the team's open PRs, bucket them by whether they need the reviewer, emit JSON.
+
+All the plumbing lives here so the skill driving it spends its tokens on judgment:
+reading diffs and writing the digest. Bucketing, ranking and the daily cap are
+mechanical, so they are decided here and handed over as an ordered result.
+
+Usage:
+  review-triage-fetch                 # dry run, prints JSON, leaves state untouched
+  review-triage-fetch --commit-state  # same, then records what was raised/deferred
+  review-triage-fetch --refresh-only  # update state for the badge without counting a nag
+  review-triage-fetch --no-cache      # ignore cached CODEOWNERS and file lists
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+from codeowners import CodeOwners  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BOTS = {"coderabbitai", "copilot", "copilot-pull-request-reviewer", "github-actions"}
+
+
+def gh(*args, check=True):
+    r = subprocess.run(["gh", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        if check:
+            sys.exit(f"gh {' '.join(args[:3])} failed: {r.stderr.strip()}")
+        return None
+    return r.stdout
+
+
+def load_config():
+    with open(os.path.join(ROOT, "config", "config.json")) as f:
+        cfg = json.load(f)
+    for key in ("state_dir", "cache_dir"):
+        cfg[key] = os.path.expanduser(cfg[key])
+    os.makedirs(cfg["state_dir"], exist_ok=True)
+    os.makedirs(cfg["cache_dir"], exist_ok=True)
+    return cfg
+
+
+def cached(cfg, key, ttl_hours, produce, use_cache=True):
+    path = os.path.join(cfg["cache_dir"], key.replace("/", "_") + ".json")
+    if use_cache and os.path.exists(path):
+        if ttl_hours is None or time.time() - os.path.getmtime(path) < ttl_hours * 3600:
+            with open(path) as f:
+                return json.load(f)
+    value = produce()
+    with open(path, "w") as f:
+        json.dump(value, f)
+    return value
+
+
+def team_members(cfg, use_cache):
+    """Re-read membership rather than hardcoding logins, so joiners/leavers land for free."""
+    def produce():
+        out = gh("api", f"orgs/{cfg['org']}/teams/{cfg['team']}/members", "--paginate",
+                 "--jq", ".[].login")
+        return sorted(out.split())
+    return cached(cfg, f"team-{cfg['team']}", cfg["cache_ttl_hours"], produce, use_cache)
+
+
+def codeowners(cfg, repo, use_cache):
+    def produce():
+        for path in cfg["codeowners_paths"]:
+            out = gh("api", f"repos/{cfg['org']}/{repo}/contents/{path}",
+                     "--jq", ".content", check=False)
+            if out and out.strip():
+                import base64
+                return {"path": path,
+                        "text": base64.b64decode(out.strip()).decode("utf-8", "replace")}
+        return {"path": None, "text": ""}
+    blob = cached(cfg, f"codeowners-{repo}", cfg["cache_ttl_hours"], produce, use_cache)
+    return blob["path"], CodeOwners(blob["text"])
+
+
+SEARCH = """
+query($q: String!, $after: String) {
+  search(query: $q, type: ISSUE, first: 50, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest {
+      number title url createdAt updatedAt isDraft
+      additions deletions changedFiles headRefOid
+      author { login }
+      repository { name }
+      commits(last: 1) { nodes { commit { pushedDate committedDate } } }
+      reviewRequests(first: 20) { nodes { requestedReviewer {
+        __typename ... on User { login } ... on Team { slug } } } }
+      reviews(first: 50) { nodes { state submittedAt author { login } } }
+    }}
+  }
+}
+"""
+
+
+def search_prs(cfg, members, me):
+    authors = " ".join(f"author:{m}" for m in members if m.lower() != me.lower())
+    q = (f"org:{cfg['org']} is:pr is:open draft:false {authors}")
+    nodes, after = [], None
+    while True:
+        args = ["api", "graphql", "-f", f"query={SEARCH}", "-f", f"q={q}"]
+        if after:
+            args += ["-f", f"after={after}"]
+        data = json.loads(gh(*args))["data"]["search"]
+        nodes += data["nodes"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return q, nodes
+        after = data["pageInfo"]["endCursor"]
+
+
+def changed_paths(cfg, repo, number, sha, use_cache):
+    def produce():
+        out = gh("api", f"repos/{cfg['org']}/{repo}/pulls/{number}/files",
+                 "--paginate", "--jq", ".[].filename", check=False)
+        return [p for p in (out or "").split("\n") if p]
+    # Keyed on head sha, so a cached list is never stale for the commit it describes.
+    return cached(cfg, f"files-{repo}-{number}-{sha[:12]}", None, produce, use_cache)
+
+
+def commit_actors(cfg, repo, number, sha, use_cache):
+    """Logins that authored or committed anything on the PR branch."""
+    def produce():
+        out = gh("api", f"repos/{cfg['org']}/{repo}/pulls/{number}/commits",
+                 "--paginate", "--jq",
+                 ".[] | [.author.login, .committer.login] | .[]", check=False)
+        return sorted({l for l in (out or "").split("\n") if l and l != "null"})
+    return cached(cfg, f"commits-{repo}-{number}-{sha[:12]}", None, produce, use_cache)
+
+
+def parse_ts(value):
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def days_old(value):
+    ts = parse_ts(value)
+    if not ts:
+        return None
+    return round((datetime.now(timezone.utc) - ts).total_seconds() / 86400, 1)
+
+
+def classify(pr, cfg, me, owner_ref, co, co_path, use_cache):
+    """Bucket one PR. `mine` means the reviewer is on the branch, so it is not theirs to review."""
+    repo = pr["repository"]["name"]
+    requested_users, requested_teams = [], []
+    for node in pr["reviewRequests"]["nodes"]:
+        rr = node.get("requestedReviewer") or {}
+        if rr.get("__typename") == "Team":
+            requested_teams.append(rr.get("slug", "").lower())
+        elif rr.get("login"):
+            requested_users.append(rr["login"].lower())
+
+    human_reviews = [r for r in pr["reviews"]["nodes"]
+                     if (r.get("author") or {}).get("login", "").lower() not in BOTS]
+    approved_by = sorted({r["author"]["login"] for r in human_reviews
+                          if r["state"] == "APPROVED"})
+    changes_by = sorted({r["author"]["login"] for r in human_reviews
+                         if r["state"] == "CHANGES_REQUESTED"})
+    my_reviews = [r for r in human_reviews
+                  if (r.get("author") or {}).get("login", "").lower() == me.lower()]
+    my_last = max((parse_ts(r["submittedAt"]) for r in my_reviews if r["submittedAt"]),
+                  default=None)
+
+    commit = (pr["commits"]["nodes"] or [{}])[0].get("commit", {})
+    head_ts = parse_ts(commit.get("pushedDate") or commit.get("committedDate"))
+    reviewed_current = bool(my_last and head_ts and my_last >= head_ts)
+
+    paths = changed_paths(cfg, repo, pr["number"], pr["headRefOid"], use_cache)
+    owned = co.matched_by(paths, owner_ref) if co_path else {}
+
+    # A branch the reviewer has commits on is theirs to get reviewed, not theirs to review.
+    # The search already drops PRs they opened; this catches ones they pushed to or co-authored.
+    actors = commit_actors(cfg, repo, pr["number"], pr["headRefOid"], use_cache)
+    my_commits = [a for a in actors if a.lower() == me.lower()]
+
+    assigned = me.lower() in requested_users or cfg["team"].lower() in requested_teams
+
+    if my_commits:
+        bucket = "mine"
+    elif assigned and not reviewed_current:
+        bucket = "assigned"
+    elif owned and not approved_by and not reviewed_current:
+        bucket = "owned"
+    else:
+        bucket = "covered"
+
+    reasons = []
+    if my_commits:
+        reasons.append("you have commits on this branch")
+    if assigned:
+        reasons.append("review requested from you")
+    if owned:
+        reasons.append(f"touches {len(owned)} owned path(s)")
+    if not human_reviews:
+        reasons.append("no human has reviewed yet")
+    elif not approved_by:
+        reasons.append("no human approval yet")
+    if changes_by:
+        reasons.append(f"changes requested by {', '.join(changes_by)}")
+    if reviewed_current:
+        reasons.append("you already reviewed this head")
+
+    return {
+        "id": f"{repo}#{pr['number']}",
+        "repo": repo,
+        "number": pr["number"],
+        "title": pr["title"],
+        "url": pr["url"],
+        "author": pr["author"]["login"],
+        "head_sha": pr["headRefOid"],
+        "bucket": bucket,
+        "reasons": reasons,
+        "age_days": days_old(pr["createdAt"]),
+        "idle_days": days_old(pr["updatedAt"]),
+        "changed_files": pr["changedFiles"],
+        "additions": pr["additions"],
+        "deletions": pr["deletions"],
+        "owned_patterns": sorted(owned.keys()),
+        "owned_files": sorted(p for ps in owned.values() for p in ps)[:20],
+        "commit_actors": actors,
+        "my_commits": bool(my_commits),
+        "requested_users": requested_users,
+        "requested_teams": requested_teams,
+        "approved_by": approved_by,
+        "changes_requested_by": changes_by,
+        "reviewed_current_head": reviewed_current,
+    }
+
+
+def new_since_seen(prior, head_sha):
+    # No stored sha means the user was never shown this PR, so nothing is "new since".
+    return bool(prior.get("sha")) and prior["sha"] != head_sha
+
+
+def next_raised(prior_raised, raised, today, shown):
+    """State entries for this run's raised PRs. `shown` is False for a scheduled refresh."""
+    out = {}
+    for item in raised:
+        prior = prior_raised.get(item["id"], {})
+        out[item["id"]] = {
+            # The sha marks what the user last saw, so a refresh that showed nothing keeps it.
+            "sha": item["head_sha"] if shown else prior.get("sha"),
+            "first_raised": today if shown and not prior.get("first_raised")
+                            else prior.get("first_raised"),
+            "last_raised": today if shown else prior.get("last_raised"),
+            # Deferred PRs never incremented this, so the counter counts real nags.
+            "times": prior.get("times", 0) + (1 if shown else 0),
+        }
+    return out
+
+
+def excluded_title(title, patterns):
+    low = title.lower()
+    for p in patterns:
+        if re.search(p, low):
+            return p
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--commit-state", action="store_true",
+                    help="record what was raised and deferred")
+    ap.add_argument("--refresh-only", action="store_true",
+                    help="write state for the badge but do not increment the nag counter; "
+                         "for scheduled runs, which show the user nothing")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore cached CODEOWNERS, team list and file lists")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    use_cache = not args.no_cache
+    me = gh("api", "user", "--jq", ".login").strip()
+    members = team_members(cfg, use_cache)
+    query, nodes = search_prs(cfg, members, me)
+
+    state_path = os.path.join(cfg["state_dir"], "state.json")
+    state = {"raised": {}, "snoozed": {}, "deferred": []}
+    if os.path.exists(state_path):
+        with open(state_path) as f:
+            state.update(json.load(f))
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    active_snoozes = {k: v for k, v in state["snoozed"].items()
+                      if v.get("until", "9999") >= today}
+
+    out_of_scope, dropped, candidates = {}, [], []
+    for pr in nodes:
+        repo = pr["repository"]["name"]
+        if repo not in cfg["scope_repos"]:
+            out_of_scope[repo] = out_of_scope.get(repo, 0) + 1
+            continue
+        hit = excluded_title(pr["title"], cfg["exclude_title_patterns"])
+        if hit:
+            dropped.append({"id": f"{repo}#{pr['number']}", "title": pr["title"],
+                            "pattern": hit})
+            continue
+        candidates.append(pr)
+
+    co_cache = {}
+    classified = []
+    for pr in candidates:
+        repo = pr["repository"]["name"]
+        if repo not in co_cache:
+            co_cache[repo] = codeowners(cfg, repo, use_cache)
+        co_path, co = co_cache[repo]
+        item = classify(pr, cfg, me, cfg["owner_ref"], co, co_path, use_cache)
+        item["codeowners_file"] = co_path
+        if item["id"] in active_snoozes:
+            item["bucket"] = "covered"
+            item["reasons"].append(f"snoozed until {active_snoozes[item['id']]['until']}")
+        prior = state["raised"].get(item["id"], {})
+        item["times_raised"] = prior.get("times", 0)
+        item["first_raised"] = prior.get("first_raised")
+        item["new_since_last_raise"] = new_since_seen(prior, item["head_sha"])
+        item["was_deferred"] = item["id"] in state["deferred"]
+        classified.append(item)
+
+    def rank(item):
+        # Assigned first, then blast radius, then age. Anything a previous run deferred
+        # gets a boost so the cap cannot starve it indefinitely.
+        return (
+            0 if item["bucket"] == "assigned" else 1,
+            0 if item["was_deferred"] else 1,
+            -(item["changed_files"] or 0),
+            -(item["additions"] or 0),
+            -(item["age_days"] or 0),
+        )
+
+    needs = sorted([i for i in classified if i["bucket"] in ("assigned", "owned")], key=rank)
+    covered = [i for i in classified if i["bucket"] == "covered"]
+    mine = [i for i in classified if i["bucket"] == "mine"]
+
+    cap = cfg["daily_cap"]
+    raised, deferred = needs[:cap], needs[cap:]
+
+    result = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "me": me,
+        "team": f"{cfg['org']}/{cfg['team']}",
+        "team_members": members,
+        "query": query,
+        "daily_cap": cap,
+        "totals": {
+            "open_team_prs": len(nodes),
+            "in_scope": len(candidates),
+            "raised": len(raised),
+            "deferred": len(deferred),
+            "covered": len(covered),
+            "mine": len(mine),
+            "out_of_scope": sum(out_of_scope.values()),
+        },
+        "raised": raised,
+        "deferred": deferred,
+        "covered": covered,
+        "mine": mine,
+        "out_of_scope_by_repo": dict(sorted(out_of_scope.items(),
+                                            key=lambda kv: -kv[1])),
+        "dropped_by_title": dropped,
+        "snoozed": active_snoozes,
+    }
+
+    if args.commit_state or args.refresh_only:
+        # Only a run that renders a digest counts as showing the user anything.
+        state["raised"] = next_raised(state["raised"], raised, today,
+                                      shown=not args.refresh_only)
+        state["deferred"] = [i["id"] for i in deferred]
+        state["snoozed"] = active_snoozes
+        state["last_run"] = result["generated_at"]
+        state["last_digest_counts"] = result["totals"]
+        with open(state_path, "w") as f:
+            json.dump(state, f, indent=2)
+
+    json.dump(result, sys.stdout, indent=2)
+    print()
+
+
+if __name__ == "__main__":
+    main()
